@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <string.h>
 
 #include "common.h"
 
@@ -57,6 +58,62 @@ static int sock_init_local(unsigned short port, int *server_fd, struct sockaddr_
     return OK;
 }
 
+int receive_packet(int server_fd, uint *ack, void *buffer, struct sockaddr_in *peer, socklen_t *peer_length) {
+    ssize_t length = recvfrom(server_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)peer, peer_length);
+    if (length < 0) {
+        perror("recvfrom");
+        return ERR;
+    }
+
+    Packet packet = *(Packet *)buffer;
+
+    byte corrupted = !checksum_is_valid(&packet);
+
+    // TODO
+
+
+    return length;
+}
+
+/// @brief Main server loop 
+void main_loop(int server_fd) 
+{
+    int res = OK;
+
+    char buffer[BUFFER_SIZE];
+    uint ack = 0;
+
+    while (1) {
+        // wait for data
+        struct sockaddr_in peer;
+        socklen_t peer_length = sizeof(peer);
+        ssize_t length = receive_packet(server_fd, &ack, buffer, &peer, &peer_length);
+        if (length < 0) {
+            perror("recvfrom");
+            continue;
+        }
+
+        Packet packet = *(Packet *)buffer;
+        
+        byte corrupted = !checksum_is_valid(&packet);
+        if (corrupted) {
+            printf("Corrupted data!\n");
+        } else {
+            printf("received: ");
+            print_packet(&packet);
+            printf("\n");
+            // if (length == 0 || packet.payload[payload_len - 1] != '\n') {
+            //     putchar('\n');
+            // }
+            fflush(stdout);
+        }
+
+        res = sendto(server_fd, buffer, (size_t)length, 0, (struct sockaddr *)&peer, peer_length);
+        if (res < 0) {
+            perror("sendto");
+        }
+    }
+}
 
 /// @brief Entry point
 int main(int argc, char **argv)
@@ -84,27 +141,7 @@ int main(int argc, char **argv)
     printf("UDP server listening on 127.0.0.1:%u\n", port);
     fflush(stdout);
 
-    // main loop
-    for (;;) {
-        unsigned char buffer[BUFFER_SIZE];
-        struct sockaddr_in peer;
-        socklen_t peer_length = sizeof(peer);
-        ssize_t length = recvfrom(server_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peer, &peer_length);
-        if (length < 0) {
-            perror("recvfrom");
-            continue;
-        }
+    main_loop(server_fd);
 
-        printf("received: ");
-        fwrite(buffer, 1, (size_t)length, stdout);
-        if (length == 0 || buffer[length - 1] != '\n') {
-            putchar('\n');
-        }
-        fflush(stdout);
-
-        res = sendto(server_fd, buffer, (size_t)length, 0, (struct sockaddr *)&peer, peer_length);
-        if (res < 0) {
-            perror("sendto");
-        }
-    }
+    return 0;
 }

@@ -7,14 +7,14 @@ all: build
 
 build: network udp_server udp_client
 
-network: network.c
-	$(CC) $(CFLAGS) network.c -o network
+network: src/network.c
+	$(CC) $(CFLAGS) src/network.c -o build/network
 
-udp_server: udp_server.c
-	$(CC) $(CFLAGS) udp_server.c -o udp_server
+udp_server: src/udp_server.c
+	$(CC) $(CFLAGS) src/udp_server.c -o build/udp_server
 
-udp_client: udp_client.c
-	$(CC) $(CFLAGS) udp_client.c -o udp_client
+udp_client: src/udp_client.c
+	$(CC) $(CFLAGS) src/udp_client.c -o build/udp_client
 
 clean:
-	rm -f network udp_server udp_client
+	rm -rf build/*

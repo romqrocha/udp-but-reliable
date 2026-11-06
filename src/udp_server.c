@@ -58,59 +58,60 @@ static int sock_init_local(unsigned short port, int *server_fd, struct sockaddr_
     return OK;
 }
 
-int receive_packet(int server_fd, uint *ack, void *buffer, struct sockaddr_in *peer, socklen_t *peer_length) {
-    ssize_t length = recvfrom(server_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)peer, peer_length);
-    if (length < 0) {
-        perror("recvfrom");
-        return ERR;
-    }
-
-    Packet packet = *(Packet *)buffer;
-
-    byte corrupted = !checksum_is_valid(&packet);
-
-    // TODO
-
-
-    return length;
-}
-
 /// @brief Main server loop 
 void main_loop(int server_fd) 
 {
     int res = OK;
 
-    char buffer[BUFFER_SIZE];
+    char send_buffer[BUFFER_SIZE];
+    char recv_buffer[BUFFER_SIZE];
+    uint seq = 0;
     uint ack = 0;
+
+    byte gate[sizeof(Packet)];
 
     while (1) {
         // wait for data
         struct sockaddr_in peer;
         socklen_t peer_length = sizeof(peer);
-        ssize_t length = receive_packet(server_fd, &ack, buffer, &peer, &peer_length);
-        if (length < 0) {
-            perror("recvfrom");
-            continue;
-        }
-
-        Packet packet = *(Packet *)buffer;
-        
-        byte corrupted = !checksum_is_valid(&packet);
-        if (corrupted) {
+        ssize_t length = receive_packet(server_fd, gate, &peer, &peer_length);
+        if (length == ERR_CORRUPTED) {
             printf("Corrupted data!\n");
-        } else {
-            printf("received: ");
-            print_packet(&packet);
-            printf("\n");
-            // if (length == 0 || packet.payload[payload_len - 1] != '\n') {
-            //     putchar('\n');
-            // }
-            fflush(stdout);
         }
 
-        res = sendto(server_fd, buffer, (size_t)length, 0, (struct sockaddr *)&peer, peer_length);
+        Packet *packet = (Packet *)gate;
+        if (length >= 0) {
+            res = order_packet(&ack, seq, packet, (byte *)recv_buffer);
+        }
+        if (res == ERR_OUTSIDE_WINDOW) {
+            printf("SEQ outside window!\n");
+        } else if (res == ERR_OUT_OF_ORDER) {
+            printf("Out of order ACK!\n");
+        }
+        
+        char *payload;
+        if (res < 0 && res == ERR_OUT_OF_ORDER) {
+            seq = packet->header.ack;
+            payload = send_buffer + (MSS * seq);
+        } else if (res < 0 || length < 0) {
+            seq = ack;
+            payload = "";
+        } else {
+            process_data(packet);
+            payload = (char *)packet->payload;
+        }
+
+        Header header = {
+            .window_length = WINDOW_LENGTH,
+            .seq = seq,
+            .ack = ack,
+        };
+        memcpy(send_buffer + (MSS * header.seq), payload, strlen(payload));
+        res = send_packet(server_fd, &peer, &header, payload);
         if (res < 0) {
             perror("sendto");
+        } else {
+            seq = increment_seq_ack(seq);
         }
     }
 }

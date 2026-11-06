@@ -3,6 +3,9 @@
 
 #define OK 0
 #define ERR -1
+#define ERR_CORRUPTED -2
+#define ERR_OUTSIDE_WINDOW -3
+#define ERR_OUT_OF_ORDER -4
 
 #define WINDOW_LENGTH 1
 #define MSS 1024
@@ -39,5 +42,39 @@ byte checksum_is_valid(Packet *packet);
 /// @brief Prints the packet in readable format
 /// @param packet the packet being printed
 void print_packet(Packet *packet);
+
+/// @brief Returns the length of this packet in bytes
+size_t packet_length(Packet *packet);
+
+/// @brief Send a message to a peer
+/// @param sender_fd the socket fd for sending the message
+/// @param network the peer's socket address
+/// @param header header information for the packet being sent
+/// @param text the payload
+/// @return OK/ERR
+int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, const char *text);
+
+/// @brief Increments a SEQ Number, ACK Number, or similar by wrapping around the window length
+/// @param seq_ack the number to be incremented
+/// @return the incremented number
+uint increment_seq_ack(uint seq_ack);
+
+/// @brief Does some arbitrary processing of the packet (probably printing the payload) 
+void process_data(Packet *packet);
+
+/// @brief Receives a packet from any peer and validates its checksum
+/// @param receiver_fd socket fd where packets are expected
+/// @param buffer where to receive the packet
+/// @param peer where to write the peer's address
+/// @param peer_length where to write the length of the peer's address
+/// @return Number of bytes received (>= 0) / ERR / ERR_CORRUPTED
+int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, socklen_t *peer_length);
+
+/// @brief Orders the given packet by placing it in the given buffer. Increases ACK if successful.
+/// @param ack what sequence number is expected
+/// @param packet the received packet 
+/// @param buffer the buffer to write the packet to
+/// @return OK/ERR_OUTSIDE_WINDOW/ERR_OUT_OF_ORDER
+int order_packet(uint *ack, uint seq, Packet *packet, byte *buffer);
 
 #endif

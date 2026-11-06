@@ -72,51 +72,17 @@ static int sock_init(Args args, struct sockaddr_in *sockaddr, int *client_fd)
     return OK;
 }
 
-/// @brief Send a message to the server
-/// @param client_fd the client's socket fd
-/// @param network the server's socket address
-/// @param text the message
-/// @param length the length of the message, in bytes
-/// @return OK/ERR
-static int send_packet(int client_fd, const struct sockaddr_in *network, uint *seq, const char *text, size_t length) 
-{
-    if (length > MSS) {
-        length = MSS;
-    }
-
-    // build packet
-    Header header = {
-        .window_length = WINDOW_LENGTH,
-        .seq = *seq,
-        .ack = 0,
-        .checksum = 0,
-    };
-    Packet packet = { .header = header };
-    memcpy(packet.payload, text, length);
-
-    // seal it with the checksum
-    packet.header.checksum = calc_checksum(&packet, sizeof(packet));
-
-    // actually send it
-    int res = sendto(client_fd, &packet, sizeof(packet), 0, (const struct sockaddr *)network, sizeof(*network));
-    if (res < 0) {
-        perror("sendto");
-        return ERR;
-    }
-
-    // update SEQ
-    *seq = (*seq + 1) % (WINDOW_LENGTH + 1);
-
-    return OK;
-}
-
 /// @brief Main client loop
 static int main_loop(struct pollfd *fds_watched, int client_fd, const struct sockaddr_in *peer_sock) 
 {
     int res = OK;
 
-    char buffer[BUFFER_SIZE];
+    char send_buffer[BUFFER_SIZE];
+    char recv_buffer[BUFFER_SIZE];
     uint seq = 0;
+    uint ack = 0;
+
+    byte gate[sizeof(Packet)];
 
     while (1) {
         // clear revents
@@ -135,33 +101,62 @@ static int main_loop(struct pollfd *fds_watched, int client_fd, const struct soc
 
         /* stdin is independent: send each available line immediately. */
         if (fds_watched[0].revents & (POLLIN | POLLHUP)) {
-            if (fgets(buffer, MSS, stdin) == NULL) {
+            if (fgets(send_buffer + (MSS * seq), MSS, stdin) == NULL) {
                 break;
             }
 
-            res = send_packet(client_fd, peer_sock, &seq, buffer, strlen(buffer));
+            Header header = {
+                .window_length = WINDOW_LENGTH,
+                .seq = seq, 
+                .ack = ack,
+            };
+            res = send_packet(client_fd, peer_sock, &header, send_buffer + (MSS * seq));
             if (res < 0) {
                 perror("send_packet");
                 return ERR;
             }
+            seq = increment_seq_ack(seq);
         }
 
         /* Echo reception is independent and never gates the next send. */
         if (fds_watched[1].revents & POLLIN) {
-            ssize_t received = recvfrom(client_fd, buffer, sizeof(buffer), 0, NULL, NULL);
-            if (received < 0 && errno == EINTR) {
-                continue;
-            } else if (received < 0) {
-                perror("recvfrom");
-                return ERR;
+            struct sockaddr_in peer;
+            socklen_t peer_length = sizeof(peer);
+            ssize_t length = receive_packet(client_fd, gate, &peer, &peer_length);
+            if (length == ERR_CORRUPTED) {
+                printf("Received corrupted data!\n");
             }
 
-            printf("echo: ");
-            fwrite(buffer, 1, (size_t)received, stdout);
-            if (received == 0 || buffer[received - 1] != '\n') {
-                putchar('\n');
+            Packet *packet = (Packet *)gate;
+            if (length >= 0) {
+                res = order_packet(&ack, seq, packet, (byte *)recv_buffer);
             }
-            fflush(stdout);
+
+            char *payload;
+            if (res < 0 && res == ERR_OUT_OF_ORDER) {
+                seq = packet->header.ack;
+                payload = send_buffer + (MSS * seq);
+                printf("Resending SEQ %d\n", seq);
+            } else if (res < 0 || length < 0) {
+                payload = "";
+                seq = ack;
+                printf("Requesting server's SEQ %d again!\n", ack);
+            } else {
+                process_data(packet);
+                continue;
+            }
+
+            Header header = {
+                .window_length = WINDOW_LENGTH,
+                .seq = seq,
+                .ack = ack,
+            };
+            res = send_packet(client_fd, &peer, &header, payload);
+            if (res < 0) {
+                perror("sendto");
+            } else {
+                seq = increment_seq_ack(seq);
+            }
         }
     }
 

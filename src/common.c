@@ -7,7 +7,21 @@
 
 #include "common.h"
 
-ushort calc_checksum(void *data, int length) {
+Header make_header(uint window_length, uint *seq, uint *ack)
+{
+    Header header = {
+        .window_length = window_length,
+        .flag_seq = seq != NULL,
+        .seq = seq != NULL ? *seq : 0,
+        .flag_ack = ack != NULL,
+        .ack = ack != NULL ? *ack : 0,
+        // checksum must be calculated later
+    };
+    return header;
+}
+
+ushort calc_checksum(void *data, int length)
+{
     // my protocol specifies 16 bit checksum
     int word_size = 2;
     ushort *words = (ushort *)data;
@@ -42,16 +56,29 @@ byte checksum_is_valid(Packet *packet) {
     return claim == actual;
 }
 
-void print_packet(Packet *packet) {
-    printf("[SEQ %d, ACK %d]: %s", packet->header.seq, packet->header.ack, packet->payload);
-}
-
 size_t packet_length(Packet *packet) {
     return sizeof(packet->header) + strlen((char *)packet->payload) + 1;
 }
 
+uint increment_seq_ack(uint seq_ack) {
+    return (seq_ack + 1) % (WINDOW_LENGTH + 1);
+}
+
+void process_data(char *payload) {
+    (void)payload;
+    // printf("received: %s\n", payload);
+    // // if (length == 0 || packet.payload[payload_len - 1] != '\n') {
+    // //     putchar('\n');
+    // // }
+    // fflush(stdout);
+}
+
 int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, const char *text) 
 {
+    if (text == NULL) {
+        text = "";
+    }
+
     int payload_length = strlen(text) + 1;
     if (payload_length > MSS) {
         payload_length = MSS;
@@ -65,28 +92,23 @@ int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, c
     // seal it with the checksum
     packet.header.checksum = calc_checksum(&packet, packet_length(&packet));
 
+    // [DEBUG] //
+    printf("Sending: ");
+    if (header->flag_seq) printf("[SEQ %d] ", header->seq);
+    if (header->flag_ack) printf("[ACK %d] ", header->ack);
+    printf("%s\n", (char *)packet.payload);
+    // [DEBUG] //
+
     // actually send it
     int res = sendto(sender_fd, &packet, packet_length(&packet), 0, (const struct sockaddr *)peer, sizeof(*peer));
     if (res < 0) {
         perror("sendto");
         return ERR;
+    } else if (header->flag_seq) {
+        header->seq = increment_seq_ack(header->seq);
     }
 
     return OK;
-}
-
-uint increment_seq_ack(uint seq_ack) {
-    return (seq_ack + 1) % (WINDOW_LENGTH + 1);
-}
-
-void process_data(Packet *packet) {
-    printf("received: ");
-    print_packet(packet);
-    printf("\n");
-    // if (length == 0 || packet.payload[payload_len - 1] != '\n') {
-    //     putchar('\n');
-    // }
-    fflush(stdout);
 }
 
 int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, socklen_t *peer_length) {
@@ -100,26 +122,26 @@ int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, sock
 
     byte corrupted = !checksum_is_valid(&packet);
     if (corrupted) {
+        // [DEBUG] //
+        printf("Received corrupted packet!\n");
+        // [DEBUG] //
+        
         return ERR_CORRUPTED;
     }
+
+    // [DEBUG] //
+    printf("Received: ");
+    if (packet.header.flag_seq) printf("[SEQ %d] ", packet.header.seq);
+    if (packet.header.flag_ack) printf("[ACK %d] ", packet.header.ack);
+    printf("%s\n", (char *)packet.payload);
+    // [DEBUG] //
 
     return length;
 }
 
-int order_packet(uint *ack, uint seq, Packet *packet, byte *buffer) {
-    if (packet->header.seq > WINDOW_LENGTH) {
-        // outside window
-        return ERR_OUTSIDE_WINDOW;
-    }
-
-    if (packet->header.ack != seq) {
-        return ERR_OUT_OF_ORDER;
-    }
-
-    buffer += packet->header.seq * MSS;
-    size_t payload_length = strlen((char *)packet->payload) + 1;
-    memcpy(buffer, packet->payload, payload_length);
-
-    *ack = increment_seq_ack(*ack);
-    return OK;
+byte is_invalid_ack(uint received_ack, uint last_ack, uint curr_seq) {
+    return (
+        ((last_ack < curr_seq) && (received_ack < last_ack || received_ack > curr_seq)) ||
+        ((last_ack > curr_seq) && (received_ack < last_ack && received_ack > curr_seq))
+    );
 }

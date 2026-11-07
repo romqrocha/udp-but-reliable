@@ -15,6 +15,8 @@
 #define ARG_COUNT 3
 #define NUM_FDS 2
 
+static uint last_ack = 0;
+
 typedef struct Args {
     struct in_addr network_ip;
     unsigned short network_port;
@@ -52,6 +54,8 @@ static int parse_args(int argc, char **argv, Args *args_out)
     return OK;
 }
 
+// ------------------------------------------------------------------------- //
+
 /// @brief Initializes the client's socket file descriptor and the peer's socket address
 /// @param args the command line arguments
 /// @param sockaddr where to write the peer's socket addr
@@ -72,6 +76,113 @@ static int sock_init(Args args, struct sockaddr_in *sockaddr, int *client_fd)
     return OK;
 }
 
+static int on_user_input(Header *header, char *buffer, size_t max_length, int client_fd, const struct sockaddr_in *peer_sock) 
+{
+    int res = OK;
+
+    if (fgets(buffer, max_length, stdin) == NULL) {
+        return ERR_STDIN_CLOSED;
+    }
+    if (strlen(buffer) > 0) {
+        buffer[strlen(buffer) - 1] = '\0'; // remove '\n'
+    }
+    
+
+    header->flag_seq = TRUE;
+    header->flag_ack = FALSE;
+    res = send_packet(client_fd, peer_sock, header, buffer);
+    if (res < 0) {
+        perror("send_packet");
+    }
+
+    return res;
+}
+
+static int on_packet_received(Header *header, char *recv_buffer, char *send_buffer, int client_fd) 
+{
+    int res = OK;
+
+    byte gate[sizeof(Packet)];
+    Packet *packet = (Packet *)gate;
+    struct sockaddr_in peer;
+    socklen_t peer_length = sizeof(peer);
+
+    ssize_t length = receive_packet(client_fd, gate, &peer, &peer_length);
+    if (length < 0) {
+        // drop packet
+        // we'll request again on a timeout
+        return length;
+    }
+
+    if (packet->header.flag_ack) {
+        if (packet->header.ack == header->seq) {
+            last_ack = packet->header.ack;
+            // no need for a timeout on the packet with seq=packet->header.ack
+        } else if (is_invalid_ack(packet->header.ack, last_ack, header->seq)) {
+            // drop packet
+            // we'll request again on a timeout
+        } else {
+            last_ack = packet->header.ack;
+            
+            uint temp = header->seq;
+            header->seq = packet->header.ack;
+            header->flag_seq = TRUE;
+            header->flag_ack = FALSE;
+            res = send_packet(client_fd, &peer, header, send_buffer + (MSS * packet->header.ack));
+            if (res < 0) {
+                perror("send_packet");
+            }
+            header->seq = temp;
+        }
+    }
+
+    if (packet->header.flag_seq) {
+        // copy into buffer or drop
+        char *buffer_dest;
+        if (packet->header.seq == header->ack) {
+            buffer_dest = recv_buffer + (MSS * packet->header.seq);
+
+            size_t payload_length = strlen((char *)packet->payload) + 1;
+            memcpy(buffer_dest, packet->payload, payload_length);
+            
+            header->ack = increment_seq_ack(header->ack);
+        } else {
+            buffer_dest = NULL;
+        }
+
+        // acknowledge
+        header->flag_seq = FALSE;
+        header->flag_ack = TRUE;
+        res = send_packet(client_fd, &peer, header, NULL);
+        if (res < 0) {
+            perror("send_packet");
+        }
+
+        // process if not dropped
+        if (buffer_dest) {
+            process_data(buffer_dest);
+        }
+    }
+
+    // char *payload;
+    // if (res < 0 && res == ERR_OUT_OF_ORDER) {
+    //     seq = packet->header.ack;
+    //     payload = send_buffer + (MSS * seq);
+    //     printf("Resending SEQ %d\n", seq);
+    // } else if (res < 0 || length < 0) {
+    //     payload = "";
+    //     seq = ack;
+    //     printf("Requesting server's SEQ %d again!\n", ack);
+    // } else {
+    //     process_data(packet);
+    //     return OK;
+    // }
+
+    // res = send_packet(client_fd, &peer, &header, payload);
+
+    return res;
+}
+
 /// @brief Main client loop
 static int main_loop(struct pollfd *fds_watched, int client_fd, const struct sockaddr_in *peer_sock) 
 {
@@ -79,10 +190,7 @@ static int main_loop(struct pollfd *fds_watched, int client_fd, const struct soc
 
     char send_buffer[BUFFER_SIZE];
     char recv_buffer[BUFFER_SIZE];
-    uint seq = 0;
-    uint ack = 0;
-
-    byte gate[sizeof(Packet)];
+    Header curr_header = make_header(WINDOW_LENGTH, NULL, NULL);
 
     while (1) {
         // clear revents
@@ -99,63 +207,18 @@ static int main_loop(struct pollfd *fds_watched, int client_fd, const struct soc
             return ERR;
         }
 
-        /* stdin is independent: send each available line immediately. */
         if (fds_watched[0].revents & (POLLIN | POLLHUP)) {
-            if (fgets(send_buffer + (MSS * seq), MSS, stdin) == NULL) {
+            char *buffer_ptr = send_buffer + (MSS * curr_header.seq);
+            res = on_user_input(&curr_header, buffer_ptr, MSS, client_fd, peer_sock);
+            if (res == ERR_STDIN_CLOSED) {
                 break;
             }
-
-            Header header = {
-                .window_length = WINDOW_LENGTH,
-                .seq = seq, 
-                .ack = ack,
-            };
-            res = send_packet(client_fd, peer_sock, &header, send_buffer + (MSS * seq));
-            if (res < 0) {
-                perror("send_packet");
-                return ERR;
-            }
-            seq = increment_seq_ack(seq);
         }
 
-        /* Echo reception is independent and never gates the next send. */
         if (fds_watched[1].revents & POLLIN) {
-            struct sockaddr_in peer;
-            socklen_t peer_length = sizeof(peer);
-            ssize_t length = receive_packet(client_fd, gate, &peer, &peer_length);
-            if (length == ERR_CORRUPTED) {
-                printf("Received corrupted data!\n");
-            }
-
-            Packet *packet = (Packet *)gate;
-            if (length >= 0) {
-                res = order_packet(&ack, seq, packet, (byte *)recv_buffer);
-            }
-
-            char *payload;
-            if (res < 0 && res == ERR_OUT_OF_ORDER) {
-                seq = packet->header.ack;
-                payload = send_buffer + (MSS * seq);
-                printf("Resending SEQ %d\n", seq);
-            } else if (res < 0 || length < 0) {
-                payload = "";
-                seq = ack;
-                printf("Requesting server's SEQ %d again!\n", ack);
-            } else {
-                process_data(packet);
-                continue;
-            }
-
-            Header header = {
-                .window_length = WINDOW_LENGTH,
-                .seq = seq,
-                .ack = ack,
-            };
-            res = send_packet(client_fd, &peer, &header, payload);
+            res = on_packet_received(&curr_header, recv_buffer, send_buffer, client_fd);
             if (res < 0) {
-                perror("sendto");
-            } else {
-                seq = increment_seq_ack(seq);
+                printf("Error sending packet %d\n", curr_header.seq);
             }
         }
     }

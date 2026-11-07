@@ -11,7 +11,10 @@
 
 #define ARG_COUNT 2
 
+static uint retries = 0;
 static uint last_ack = 0;
+static struct sockaddr_in peer = {0};
+static socklen_t peer_length = sizeof(peer);
 
 /// @brief Handles the parsing of command line arguments
 /// @param argc number of arguments entered
@@ -62,14 +65,12 @@ static int sock_init_local(unsigned short port, int *server_fd, struct sockaddr_
     return OK;
 }
 
-static int on_packet_received(Header *header, char *recv_buffer, char *send_buffer, int client_fd) 
+static int on_packet_received(Header *header, char *recv_buffer, char *send_buffer, int client_fd, long *timeouts) 
 {
     int res = OK;
 
     byte gate[sizeof(Packet)];
     Packet *packet = (Packet *)gate;
-    struct sockaddr_in peer;
-    socklen_t peer_length = sizeof(peer);
 
     ssize_t length = receive_packet(client_fd, gate, &peer, &peer_length);
     if (length < 0) {
@@ -81,17 +82,19 @@ static int on_packet_received(Header *header, char *recv_buffer, char *send_buff
     if (packet->header.flag_ack) {
         if (packet->header.ack == header->seq) {
             last_ack = packet->header.ack;
-            // no need for a timeout on the packet with seq=packet->header.ack
+            retries = 0;
         } else if (is_invalid_ack(packet->header.ack, last_ack, header->seq)) {
             // drop packet
+            // we'll request again on a timeout
         } else {
             last_ack = packet->header.ack;
+            retries = 0;
             
             uint temp = header->seq;
             header->seq = packet->header.ack;
             header->flag_seq = TRUE;
             header->flag_ack = FALSE;
-            res = send_packet(client_fd, &peer, header, send_buffer + (MSS * packet->header.ack));
+            res = send_packet(client_fd, &peer, header, send_buffer + (MSS * packet->header.ack), timeouts);
             if (res < 0) {
                 perror("send_packet");
             }
@@ -116,7 +119,7 @@ static int on_packet_received(Header *header, char *recv_buffer, char *send_buff
         // acknowledge
         header->flag_seq = FALSE;
         header->flag_ack = TRUE;
-        res = send_packet(client_fd, &peer, header, NULL);
+        res = send_packet(client_fd, &peer, header, NULL, NULL);
         if (res < 0) {
             perror("send_packet");
         }
@@ -131,29 +134,12 @@ static int on_packet_received(Header *header, char *recv_buffer, char *send_buff
 
             header->flag_seq = TRUE;
             header->flag_ack = FALSE;
-            res = send_packet(client_fd, &peer, header, (char *)packet->payload);
+            res = send_packet(client_fd, &peer, header, (char *)packet->payload, timeouts);
             if (res < 0) {
                 perror("send_packet");
-                return ERR;
             }            
         }
     }
-
-    // char *payload;
-    // if (res < 0 && res == ERR_OUT_OF_ORDER) {
-    //     seq = packet->header.ack;
-    //     payload = send_buffer + (MSS * seq);
-    //     printf("Resending SEQ %d\n", seq);
-    // } else if (res < 0 || length < 0) {
-    //     payload = "";
-    //     seq = ack;
-    //     printf("Requesting server's SEQ %d again!\n", ack);
-    // } else {
-    //     process_data(packet);
-    //     return OK;
-    // }
-
-    // res = send_packet(client_fd, &peer, &header, payload);
 
     return res;
 }
@@ -163,16 +149,25 @@ void main_loop(struct pollfd *watched_fd, int server_fd)
 {
     int res = OK;
 
+    long timeouts[WINDOW_LENGTH + 1] = {0};
     char send_buffer[BUFFER_SIZE];
     char recv_buffer[BUFFER_SIZE];
     Header curr_header = make_header(WINDOW_LENGTH, NULL, NULL);
 
     while (1) {
+        int next_wait_ms = -1;
+        if (timeouts[last_ack] != 0) {
+            next_wait_ms = (int)(timeouts[last_ack] - monotonic_ms);
+            if (next_wait_ms < 0) {
+                next_wait_ms = 0;
+            }  
+        }
+
         // clear revents
         watched_fd->revents = 0;
 
-        // wait for poll event
-        int ready = poll(watched_fd, 1, -1);
+        // wait for poll event or timeout
+        int ready = poll(watched_fd, 1, next_wait_ms);
         if (ready < 0 && errno == EINTR) {
             continue;
         } else if (ready < 0) {
@@ -181,10 +176,32 @@ void main_loop(struct pollfd *watched_fd, int server_fd)
         }
 
         if (watched_fd->revents & POLLIN) {
-            res = on_packet_received(&curr_header, recv_buffer, send_buffer, server_fd);
-            if (res < 0) {
+            res = on_packet_received(&curr_header, recv_buffer, send_buffer, server_fd, timeouts);
+            if (res < 0 && res != ERR_CORRUPTED) {
                 printf("Error sending packet %d\n", curr_header.seq);
             }
+        }
+
+        if (increment_seq_ack(curr_header.seq) != last_ack) {
+            // send any packets you may have pending
+        }
+        if (curr_header.seq != last_ack && timeouts[last_ack] <= monotonic_ms) {
+            if (retries >= MAX_RETRIES) {
+                perror("max retries exceeded");
+                break;
+            } else {
+                retries++;
+            }
+            
+            uint temp = curr_header.seq;
+            curr_header.seq = last_ack;
+            curr_header.flag_seq = TRUE;
+            curr_header.flag_ack = FALSE;
+            res = send_packet(server_fd, &peer, &curr_header, send_buffer + (MSS * curr_header.seq), timeouts);
+            if (res < 0) {
+                printf("Error resending packet %d\n", curr_header.seq);
+            }
+            curr_header.seq = temp;
         }
     }
 }

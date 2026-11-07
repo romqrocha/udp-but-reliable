@@ -5,7 +5,19 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define __USE_POSIX199309
+#include <time.h>
+
 #include "common.h"
+
+long get_monotonic_ms() {
+    struct timespec time;
+    if (clock_gettime(CLOCK_MONOTONIC, &time) == -1) {
+        abort();
+    }
+    long ms = (long)time.tv_sec * 1000 + time.tv_nsec / 1000000;
+    return ms;
+}
 
 Header make_header(uint window_length, uint *seq, uint *ack)
 {
@@ -73,7 +85,7 @@ void process_data(char *payload) {
     // fflush(stdout);
 }
 
-int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, const char *text) 
+int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, const char *text, long *timeouts) 
 {
     if (text == NULL) {
         text = "";
@@ -103,12 +115,13 @@ int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, c
     int res = sendto(sender_fd, &packet, packet_length(&packet), 0, (const struct sockaddr *)peer, sizeof(*peer));
     if (res < 0) {
         perror("sendto");
-        return ERR;
     } else if (header->flag_seq) {
+        timeouts[header->seq] = monotonic_ms + MAX_RTT_MS;
+        
         header->seq = increment_seq_ack(header->seq);
     }
 
-    return OK;
+    return res;
 }
 
 int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, socklen_t *peer_length) {
@@ -125,7 +138,7 @@ int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, sock
         // [DEBUG] //
         printf("Received corrupted packet!\n");
         // [DEBUG] //
-        
+
         return ERR_CORRUPTED;
     }
 
@@ -142,6 +155,7 @@ int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, sock
 byte is_invalid_ack(uint received_ack, uint last_ack, uint curr_seq) {
     return (
         ((last_ack < curr_seq) && (received_ack < last_ack || received_ack > curr_seq)) ||
-        ((last_ack > curr_seq) && (received_ack < last_ack && received_ack > curr_seq))
+        ((last_ack > curr_seq) && (received_ack < last_ack && received_ack > curr_seq)) ||
+        (last_ack == curr_seq)
     );
 }

@@ -10,10 +10,14 @@
 #define ERR_OUTSIDE_WINDOW -3
 #define ERR_OUT_OF_ORDER -4
 #define ERR_STDIN_CLOSED -5
+#define ERR_MAX_RETRIES -6
 
-#define WINDOW_LENGTH 1
+#define WINDOW_LENGTH 2
+#define MAX_USER_INPUT 64
 #define MSS 1024
 #define BUFFER_SIZE (WINDOW_LENGTH + 1) * MSS
+#define MAX_RTT_MS 10000
+#define MAX_RETRIES 5
 
 typedef unsigned long ulong;
 typedef unsigned int uint;
@@ -28,7 +32,6 @@ typedef struct Header {
     uint seq;
     uint ack;
 } Header;
-
 Header make_header(uint window_length, uint *seq, uint *ack); 
 
 typedef struct Packet {
@@ -70,8 +73,9 @@ byte is_invalid_ack(uint received_ack, uint last_ack, uint curr_seq);
 /// @param network the peer's socket address
 /// @param header header information for the packet being sent
 /// @param text the payload
+/// @param timeouts array of timeouts corresponding to each packet sent
 /// @return OK/ERR
-int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, const char *text);
+int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, const char *text, long *timeouts);
 
 /// @brief Receives a packet from any peer and validates its checksum
 /// @param receiver_fd socket fd where packets are expected
@@ -80,5 +84,10 @@ int send_packet(int sender_fd, const struct sockaddr_in *peer, Header *header, c
 /// @param peer_length where to write the length of the peer's address
 /// @return Number of bytes received (>= 0) / ERR / ERR_CORRUPTED
 int receive_packet(int receiver_fd, void *buffer, struct sockaddr_in *peer, socklen_t *peer_length);
+
+
+/// @return The monotonic time in milliseconds 
+long get_monotonic_ms();
+#define monotonic_ms get_monotonic_ms()
 
 #endif
